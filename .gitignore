@@ -14,3 +14,6 @@ apps/web/.tanstack/
 apps/web/.wrangler/
 apps/api/.venv/
 packages/crawler/.venv/
+
+# macOS
+.DS_Store

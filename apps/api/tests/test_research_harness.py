@@ -470,8 +470,10 @@ class PipelineSnapshotTests(unittest.IsolatedAsyncioTestCase):
         result = await self._pipeline_result("run-integrated", harness_store=self.store)
 
         manifest = self.store.read_manifest("run-integrated")
-        checkpoint = self.store.read_checkpoint("run-integrated", "research_pipeline")
-        self.assertEqual(manifest.operators["research_pipeline"].status, "completed")
+        # The pipeline is split into granular resumable operators
+        for operator_name in ("coverage_gate", "evidence_structuring", "report_synthesis", "claim_grounding"):
+            self.assertEqual(manifest.operators[operator_name].status, "completed")
+        checkpoint = self.store.read_checkpoint("run-integrated", "claim_grounding")
         self.assertIsNotNone(checkpoint)
         self.assertEqual(checkpoint.payload["reportStatus"], result.verified_report.report.status)
         self.assertEqual(
@@ -481,7 +483,7 @@ class PipelineSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pipeline_checkpoint_input_hash_covers_acquired_source_content(self) -> None:
         await self._pipeline_result("run-input", harness_store=self.store)
-        first_hash = self.store.read_checkpoint("run-input", "research_pipeline").inputHash
+        first_hash = self.store.read_checkpoint("run-input", "coverage_gate").inputHash
         first_initial_hash = self.store.read_manifest("run-input").metadata["initialHash"]
 
         await self._pipeline_result(
@@ -489,7 +491,7 @@ class PipelineSnapshotTests(unittest.IsolatedAsyncioTestCase):
             harness_store=self.store,
             second_summary="Battery degrades rapidly under heavy use.",
         )
-        second_hash = self.store.read_checkpoint("run-input", "research_pipeline").inputHash
+        second_hash = self.store.read_checkpoint("run-input", "coverage_gate").inputHash
         second_initial_hash = self.store.read_manifest("run-input").metadata["initialHash"]
 
         self.assertNotEqual(first_hash, second_hash)

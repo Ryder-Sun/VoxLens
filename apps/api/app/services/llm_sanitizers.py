@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
-from app.models import CitationText, ReportInsight, ReportSection
+from app.models import CitationRef, CitationText, ReportInsight, ReportSection
 from app.services.llm_types import LlmSynthesisResult, SemanticEvidenceExtraction
 
 
@@ -20,7 +20,7 @@ def result_from_payload(payload: dict[str, Any], allowed_ids: set[int]) -> LlmSy
         _sanitize_sections(payload.get("sections", []), allowed_ids)
     )
     warnings = [str(item)[:240] for item in payload.get("warnings", []) if str(item).strip()]
-    return LlmSynthesisResult(takeaways=takeaways[:6], insights=insights[:6], sections=sections[:8], warnings=warnings[:6])
+    return LlmSynthesisResult(takeaways=takeaways[:8], insights=insights[:8], sections=sections[:14], warnings=warnings[:6])
 
 
 def _sanitize_citation_items(items: Any, allowed_ids: set[int]) -> list[dict[str, Any]]:
@@ -36,8 +36,42 @@ def _sanitize_citation_items(items: Any, allowed_ids: set[int]) -> list[dict[str
         sanitized.append({
             "text": text,
             "citations": valid_ids(item.get("citations", item.get("sourceIds", [])), allowed_ids),
+            "citationRefs": _sanitize_citation_refs(item.get("citationRefs", []), allowed_ids),
         })
     return sanitized
+
+
+def _sanitize_citation_refs(items: Any, allowed_ids: set[int]) -> list[dict[str, Any]]:
+    """Sanitize structured citation references with timestamp/comment context."""
+    sanitized: list[dict[str, Any]] = []
+    if not isinstance(items, list):
+        return sanitized
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_id = item.get("sourceId", item.get("source_id"))
+        try:
+            source_id = int(source_id) if source_id is not None else 0
+        except (TypeError, ValueError):
+            continue
+        if source_id not in allowed_ids:
+            continue
+        ref = {
+            "sourceId": source_id,
+            "evidenceUnitId": str(item.get("evidenceUnitId", item.get("evidence_unit_id", "")))[:120],
+            "platform": str(item.get("platform", ""))[:40],
+            "platformObjectId": str(item.get("platformObjectId", item.get("platform_object_id", "")))[:120],
+            "commentId": str(item.get("commentId", item.get("comment_id", "")))[:120],
+            "citationRef": str(item.get("citationRef", item.get("citation_ref", "")))[:200],
+        }
+        start_ms = item.get("startMs", item.get("start_ms"))
+        end_ms = item.get("endMs", item.get("end_ms"))
+        if start_ms is not None:
+            ref["startMs"] = max(0, int(start_ms))
+        if end_ms is not None:
+            ref["endMs"] = max(0, int(end_ms))
+        sanitized.append(ref)
+    return sanitized[:12]
 
 
 def _sanitize_insights(items: Any, allowed_ids: set[int]) -> list[dict[str, Any]]:
@@ -84,6 +118,7 @@ def _sanitize_sections(items: Any, allowed_ids: set[int]) -> list[dict[str, Any]
             "quote": None,
             "table": _sanitize_table_rows(item.get("table", []), allowed_ids),
             "sourceIds": valid_ids(item.get("sourceIds", item.get("citations", [])), allowed_ids),
+            "citationRefs": _sanitize_citation_refs(item.get("citationRefs", []), allowed_ids),
             "metrics": item.get("metrics", {}) if isinstance(item.get("metrics"), dict) else {},
             "data": item.get("data", {}) if isinstance(item.get("data"), dict) else {},
         }

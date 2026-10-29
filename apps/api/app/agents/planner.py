@@ -70,7 +70,10 @@ def build_research_plan(request: ResearchRequest) -> tuple[ResearchPlan, AgentSt
             authMode=request.authMode,
             role="primary",
         ))
-        if platform == "bilibili" and request.useCrawlerRuntime:
+        # Only schedule a cross-provider fallback when the platform actually has
+        # a second implemented provider (registry.py); otherwise skip to avoid
+        # "unsupported local target" noise.
+        if platform in {"bilibili"} and request.useCrawlerRuntime:
             targets.append(CrawlTarget(
                 platform=platform,
                 provider="opencli" if primary == "crawler" else "crawler",

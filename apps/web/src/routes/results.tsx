@@ -317,7 +317,10 @@ function Results() {
     };
   }, []);
 
+  const introPlayedRef = useRef(false);
   useEffect(() => {
+    if (!report || introPlayedRef.current) return;
+    introPlayedRef.current = true;
     const ctx = gsap.context(() => {
       gsap.from("[data-rise]", {
         y: 18,

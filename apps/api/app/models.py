@@ -194,9 +194,35 @@ class PlatformSummary(BaseModel):
     note: str = ""
 
 
+class CitationRef(BaseModel):
+    """Structured citation anchored to a specific evidence unit with timestamp/comment context."""
+
+    sourceId: int
+    evidenceUnitId: str = ""
+    platform: str = ""
+    platformObjectId: str = ""
+    startMs: int | None = Field(default=None, ge=0)
+    endMs: int | None = Field(default=None, ge=0)
+    commentId: str = ""
+    citationRef: str = ""
+
+    def format_ref(self) -> str:
+        """Return the human-readable citation reference string."""
+        if self.citationRef:
+            return self.citationRef
+        platform_name = self.platform.upper()
+        if self.commentId:
+            return f"[{platform_name}:{self.platformObjectId}/comment/{self.commentId}]"
+        if self.startMs is not None:
+            end_ms = self.endMs if self.endMs is not None else self.startMs
+            return f"[{platform_name}:{self.platformObjectId}@{_format_timestamp(self.startMs)}-{_format_timestamp(end_ms)}]"
+        return f"[{platform_name}:{self.platformObjectId}]"
+
+
 class CitationText(BaseModel):
     text: str
     citations: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
 
 
 class VideoQuote(BaseModel):
@@ -237,6 +263,7 @@ class DecisionCandidate(BaseModel):
     name: str
     matchReason: str = ""
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
 
 
 class DimensionComparisonValue(BaseModel):
@@ -245,6 +272,7 @@ class DimensionComparisonValue(BaseModel):
     condition: str = ""
     confidence: str = "gray"
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
 
 
 class DimensionComparison(BaseModel):
@@ -264,6 +292,7 @@ class ReportSection(BaseModel):
     quote: VideoQuote | None = None
     table: list[ComparisonRow] = Field(default_factory=list)
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
     metrics: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
 
@@ -275,6 +304,7 @@ class OutlineItem(BaseModel):
     summary: str = ""
     status: StageStatus = "queued"
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
     citationCount: int = 0
 
 
@@ -352,6 +382,7 @@ class ReportInsight(BaseModel):
     summary: str = ""
     confidence: int = Field(default=3, ge=1, le=5)
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
 
 
 class CoverageSummary(BaseModel):
@@ -371,6 +402,7 @@ class QualityMetric(BaseModel):
     label: str = ""
     rationale: str = ""
     sourceIds: list[int] = Field(default_factory=list)
+    citationRefs: list[CitationRef] = Field(default_factory=list)
 
 
 class QualityEvaluation(BaseModel):

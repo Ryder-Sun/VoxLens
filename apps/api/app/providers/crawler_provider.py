@@ -166,6 +166,9 @@ def _search_with_crawler(
             for idx, row in enumerate(content_rows[:limit], start=1)
         ]
         note = "" if sources else (stderr or stdout or "no results")[:240]
+        if not sources:
+            hint = f"{platform}: no sources returned. Configure {COOKIE_ENV_ALIASES.get(platform, ('VOXLENS_' + platform.upper() + '_COOKIE',))[0]} or log in once in the managed browser window."
+            note = (note + " | " if note else "") + hint
         if login_type == "qrcode" and auth_mode in {"auto", "existing_browser"}:
             note = (note + " " if note else "") + f"auth={auth_mode} uses a local Chrome/CDP persistent profile; if Chrome:9222 is already available, VoxLens attaches to it; maxNotes={max_notes}; parallelVideos={_safe_parallelism(video_parallelism)}"
         return sources, RunLog(provider="crawler", platform=platform, ok=bool(sources) or code == 0, count=len(sources), elapsedSec=elapsed, note=note[:260])
@@ -188,7 +191,9 @@ def _local_browser_env() -> dict[str, str]:
     return {
         "VOXLENS_MC_ENABLE_CDP": os.getenv("VOXLENS_MC_ENABLE_CDP", "1"),
         "VOXLENS_MC_CDP_CONNECT_EXISTING": os.getenv("VOXLENS_MC_CDP_CONNECT_EXISTING", "1"),
-        "VOXLENS_MC_CDP_REQUIRE_EXISTING": os.getenv("VOXLENS_MC_CDP_REQUIRE_EXISTING", "1"),
+        # Attach to an existing logged-in Chrome when available, otherwise launch a
+        # managed local browser with persistent login state instead of failing hard.
+        "VOXLENS_MC_CDP_REQUIRE_EXISTING": os.getenv("VOXLENS_MC_CDP_REQUIRE_EXISTING", "0"),
         "VOXLENS_MC_SAVE_LOGIN_STATE": os.getenv("VOXLENS_MC_SAVE_LOGIN_STATE", "1"),
         "VOXLENS_MC_AUTO_CLOSE_BROWSER": os.getenv("VOXLENS_MC_AUTO_CLOSE_BROWSER", "0"),
         "VOXLENS_MC_HEADLESS": os.getenv("VOXLENS_MC_HEADLESS", "0"),

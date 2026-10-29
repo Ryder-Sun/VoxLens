@@ -19,7 +19,7 @@ from app.agents.evidence import assess_evidence_quality, prepare_evidence
 from app.agents.grounding_verifier import ClaimGroundingVerifier, ClaimVerification
 from app.agents.llm_orchestrator import LLMCallSpec, LLMOrchestrator
 from app.agents.planner import analyze_research_question, build_research_plan
-from app.harness import FileHarnessStore, HarnessOperator, ResearchHarness
+from app.harness import FileHarnessStore, HarnessContext, HarnessOperator, ResearchHarness
 from app.models import (
     AgentStep,
     Artifact,
@@ -34,7 +34,7 @@ from app.models import (
     Source,
 )
 from app.services.asr_pipeline import plan_asr_candidates
-from app.services.llm_synthesis import synthesize_with_llm
+from app.services.llm_synthesis import synthesize_with_llm, synthesize_with_llm_async
 from app.services.llm_types import LlmSynthesisResult
 from app.services.report_builder import build_report, infer_report_kind
 from app.utils import dedupe_sources_key, text_excerpt
@@ -130,7 +130,14 @@ async def complete_research_pipeline(
     run_id: str,
     harness_store: FileHarnessStore | None = None,
 ) -> PipelineResult:
-    """Run the post-acquisition pipeline directly or through the file-backed harness."""
+    """Run the post-acquisition pipeline with granular resumable harness operators.
+
+    When harness_store is provided the pipeline is split into individually
+    checkpointable operators (coverage, evidence, synthesis, verification) so
+    that a crash or timeout can resume from the last completed stage instead of
+    restarting from scratch. When no store is provided, falls back to direct
+    execution with no checkpointing.
+    """
 
     if harness_store is None:
         return await _complete_research_pipeline(
@@ -141,25 +148,204 @@ async def complete_research_pipeline(
             run_id=run_id,
         )
 
-    async def execute_pipeline(_context: object) -> PipelineResult:
-        result = await _complete_research_pipeline(
-            request=request,
-            plan=plan,
-            acquisition_batch=acquisition_batch,
-            budget=budget,
-            run_id=run_id,
+    # --- Granular harness operators with dependencies ---
+    # coverage_gate → evidence_structuring → report_synthesis → claim_grounding
+
+    async def _run_coverage(ctx: HarnessContext) -> dict[str, Any]:
+        plan_spec = create_plan_spec(request, plan)
+        coverage_gate = CoverageGate()
+        acquisition = acquisition_batch
+        stop_policy = StopPolicy()
+
+        coverage = coverage_gate.evaluate(acquisition, plan_spec)
+        steps: list[AgentStep] = []
+
+        if (
+            coverage_gate.should_block_synthesis(coverage, budget)
+            and stop_policy.should_continue_search(acquisition, budget)
+        ):
+            retry_plan = _supplemental_plan(plan, coverage, budget)
+            if retry_plan.targets:
+                retry_batch, retry_step = acquire_sources(request, retry_plan, budget)
+                acquisition = merge_acquisition_batches(acquisition, retry_batch, budget.max_sources)
+                budget.set_sources_collected(len(acquisition.sources))
+                coverage = coverage_gate.evaluate(acquisition, plan_spec)
+                steps.append(retry_step.model_copy(update={
+                    "name": "SupplementalCrawlerAgent",
+                    "role": "Retries uncovered platforms or evidence gaps within the shared research budget.",
+                }))
+
+        blocked = coverage_gate.should_block_synthesis(coverage, budget)
+        steps.append(_coverage_step(coverage, coverage_gate.identify_gaps(coverage, plan_spec), blocked))
+        return {
+            "acquisition_batch": acquisition,
+            "coverage": coverage,
+            "blocked": blocked,
+            "steps": steps,
+        }
+
+    def _dump_coverage(result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "sources": len(result["acquisition_batch"].sources),
+            "blocked": result["blocked"],
+            "platformsCovered": len(result["coverage"].platforms_covered),
+        }
+
+    async def _run_evidence(ctx: HarnessContext) -> dict[str, Any]:
+        coverage_result = ctx.get("coverage_gate")
+        acquisition = coverage_result["acquisition_batch"]
+        evidence_batch, evidence_step = prepare_evidence_batch(acquisition)
+        return {
+            "acquisition_batch": acquisition,
+            "coverage": coverage_result["coverage"],
+            "blocked": coverage_result["blocked"],
+            "steps": [*coverage_result["steps"], evidence_step],
+            "evidence_batch": evidence_batch,
+        }
+
+    def _dump_evidence(result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evidenceUnits": len(result["evidence_batch"].evidence_units),
+            "sources": len(result["acquisition_batch"].sources),
+        }
+
+    async def _run_synthesis(ctx: HarnessContext) -> dict[str, Any]:
+        evidence_result = ctx.get("evidence_structuring")
+        acquisition = evidence_result["acquisition_batch"]
+        evidence_batch = evidence_result["evidence_batch"]
+        coverage = evidence_result["coverage"]
+        blocked = evidence_result["blocked"]
+        steps = list(evidence_result["steps"])
+
+        min_sources = request.minLiveSources or 1
+        if len(acquisition.sources) < min_sources or StopPolicy().should_stop_for_insufficient_evidence(acquisition):
+            steps.append(AgentStep(
+                name="FallbackGuardAgent",
+                role="Prevents ungrounded synthesis when live evidence is below the requested threshold.",
+                status="partial",
+                message=(
+                    f"Only {len(acquisition.sources)} live sources collected; requested at least {min_sources}. "
+                    "Building an evidence-limited report."
+                ),
+                metrics={"liveSources": len(acquisition.sources), "minSources": min_sources},
+            ))
+
+        report_sources = _sources_for_report(acquisition, evidence_batch)
+        report_orchestrator = LLMOrchestrator(
+            budget,
+            _report_llm_provider(request, report_sources) if not blocked and _llm_available() else None,
         )
-        harness_store.write_pipeline_snapshot(run_id, result)
-        return result
+        report_started = time.perf_counter()
+        report = await _build_report_with_orchestrator(
+            request=request,
+            sources=report_sources,
+            run_logs=[log.model_copy(deep=True) for log in acquisition.collection_logs],
+            run_id=run_id,
+            orchestrator=report_orchestrator,
+        )
+        steps.append(AgentStep(
+            name="ReportSynthesisAgent",
+            role="Builds the structured report after the coverage gate and within the shared LLM budget.",
+            status="partial" if blocked else "ok",
+            message=(
+                "Coverage gaps blocked LLM synthesis; generated the deterministic evidence-limited report."
+                if blocked
+                else "Generated the report through the budgeted LLM orchestrator with deterministic fallback."
+            ),
+            elapsedSec=round(time.perf_counter() - report_started, 3),
+            metrics={
+                "sections": len(report.sections),
+                "takeaways": len(report.takeaways),
+                **report_orchestrator.remaining_budget(),
+            },
+        ))
+        return {
+            "acquisition_batch": acquisition,
+            "evidence_batch": evidence_batch,
+            "coverage": coverage,
+            "blocked": blocked,
+            "steps": steps,
+            "report": report,
+        }
+
+    def _dump_synthesis(result: dict[str, Any]) -> dict[str, Any]:
+        report = result["report"]
+        return {
+            "sections": len(report.sections),
+            "takeaways": len(report.takeaways),
+            "reportStatus": report.status,
+        }
+
+    async def _run_verification(ctx: HarnessContext) -> PipelineResult:
+        synth_result = ctx.get("report_synthesis")
+        acquisition = synth_result["acquisition_batch"]
+        evidence_batch = synth_result["evidence_batch"]
+        coverage = synth_result["coverage"]
+        blocked = synth_result["blocked"]
+        steps = list(synth_result["steps"])
+        report = synth_result["report"]
+
+        claim_set = build_claim_set_from_report(report, evidence_batch, coverage, run_id)
+        verifications = ClaimGroundingVerifier().verify_claims(
+            list(claim_set.claims),
+            list(evidence_batch.evidence_units),
+            list(claim_set.claim_evidence_links),
+        )
+        steps.append(_verification_step(verifications))
+        _append_architecture_warnings(report, coverage, blocked, verifications)
+
+        return PipelineResult(
+            acquisition_batch=acquisition,
+            evidence_batch=evidence_batch,
+            claim_set=claim_set,
+            verified_report=VerifiedReport(
+                report=report,
+                verification_results=tuple(verifications),
+                coverage_gate_passed=not blocked,
+                budget_remaining=budget.remaining(),
+            ),
+            steps=tuple(steps),
+        )
+
+    def _dump_verification(result: PipelineResult) -> dict[str, Any]:
+        return _pipeline_checkpoint_payload(result)
+
+    operators = [
+        HarnessOperator(
+            name="coverage_gate",
+            version="1",
+            run=_run_coverage,
+            dump=_dump_coverage,
+            resumable=True,
+        ),
+        HarnessOperator(
+            name="evidence_structuring",
+            version="1",
+            run=_run_evidence,
+            dump=_dump_evidence,
+            dependencies=("coverage_gate",),
+            resumable=True,
+        ),
+        HarnessOperator(
+            name="report_synthesis",
+            version="1",
+            run=_run_synthesis,
+            dump=_dump_synthesis,
+            dependencies=("evidence_structuring",),
+            resumable=True,
+        ),
+        HarnessOperator(
+            name="claim_grounding",
+            version="1",
+            run=_run_verification,
+            dump=_dump_verification,
+            dependencies=("report_synthesis",),
+            resumable=True,
+        ),
+    ]
 
     outputs = await ResearchHarness(harness_store, run_id).run(
-        [HarnessOperator(
-            name="research_pipeline",
-            version="1",
-            run=execute_pipeline,
-            dump=_pipeline_checkpoint_payload,
-            resumable=False,
-        )],
+        operators,
         initial_values=_pipeline_harness_inputs(
             request=request,
             plan=plan,
@@ -167,9 +353,11 @@ async def complete_research_pipeline(
             budget=budget,
             run_id=run_id,
         ),
-        mode="execute",
+        mode="resume",
     )
-    return outputs["research_pipeline"]
+    pipeline_result: PipelineResult = outputs["claim_grounding"]
+    harness_store.write_pipeline_snapshot(run_id, pipeline_result)
+    return pipeline_result
 
 
 async def _complete_research_pipeline(
@@ -422,7 +610,13 @@ def merge_acquisition_batches(
 
 
 def prepare_evidence_batch(batch: AcquisitionBatch) -> tuple[EvidenceBatch, AgentStep]:
-    """Prepare immutable evidence units from copied acquisition sources."""
+    """Prepare immutable evidence units from copied acquisition sources.
+
+    When transcript segments are available, creates segment-level evidence units
+    with timestamp ranges (start_ms/end_ms) for precise citation anchoring.
+    Also creates comment-level evidence units with comment_id for comment citations.
+    Falls back to a single coarse unit per source when no segments are available.
+    """
 
     mutable_sources = [source.model_copy(deep=True) for source in batch.sources]
     ranked_sources, step = prepare_evidence(mutable_sources)
@@ -433,23 +627,75 @@ def prepare_evidence_batch(batch: AcquisitionBatch) -> tuple[EvidenceBatch, Agen
 
     for source in ranked_sources:
         artifact = artifacts_by_source[source.id]
-        transcript = source.fullTranscript or source.transcriptText or source.transcriptPreview
-        text = text_excerpt(
-            [transcript, source.summary, source.title, *[comment.text for comment in source.comments[:3]]],
-            1600,
-        )
-        unit = EvidenceUnit(
-            id=f"evidence-{source.id}",
-            text=text or source.title,
-            modality="speech" if transcript else "text",
-            source_id=source.id,
-            artifact_id=artifact.id,
-            normalized_text=(text or source.title).strip().lower(),
-            extraction_method="legacy-source-adapter",
-            content_hash=artifact.content_hash,
-        )
-        assessment = assess_evidence_quality(source, artifact=artifact, evidence_unit=unit)
-        evidence_units.append(unit)
+        segments = source.transcriptSegments or list(artifact.transcript_segments)
+        created_segment_units = False
+
+        # Create segment-level evidence units with timestamps
+        for seg_idx, segment in enumerate(segments[:40]):
+            seg_text = (segment.text or "").strip()
+            if not seg_text or len(seg_text) < 8:
+                continue
+            start_ms = _parse_timestamp_to_ms(segment.start)
+            end_ms = _parse_timestamp_to_ms(segment.end)
+            if start_ms is not None and end_ms is not None and end_ms < start_ms:
+                end_ms = start_ms
+            unit = EvidenceUnit(
+                id=f"evidence-{source.id}-seg-{seg_idx}",
+                text=seg_text[:1600],
+                modality="speech",
+                source_id=source.id,
+                artifact_id=artifact.id,
+                normalized_text=seg_text.strip().lower()[:1600],
+                start_ms=start_ms,
+                end_ms=end_ms,
+                extraction_method="transcript-segment",
+                content_hash=artifact.content_hash,
+                language="",
+            )
+            evidence_units.append(unit)
+            created_segment_units = True
+
+        # Create comment-level evidence units
+        for cmt_idx, comment in enumerate(source.comments[:8]):
+            cmt_text = (comment.text or "").strip()
+            if not cmt_text:
+                continue
+            cmt_id = getattr(comment, "id", "") or f"c{cmt_idx}"
+            unit = EvidenceUnit(
+                id=f"evidence-{source.id}-cmt-{cmt_idx}",
+                text=cmt_text[:800],
+                modality="comment",
+                source_id=source.id,
+                artifact_id=artifact.id,
+                normalized_text=cmt_text.strip().lower()[:800],
+                comment_id=cmt_id,
+                author=comment.author,
+                extraction_method="comment",
+                content_hash=artifact.content_hash,
+            )
+            evidence_units.append(unit)
+
+        # Fallback: single coarse unit if no segments or comments
+        if not created_segment_units and not any(u.source_id == source.id for u in evidence_units if u.modality == "comment"):
+            transcript = source.fullTranscript or source.transcriptText or source.transcriptPreview
+            text = text_excerpt(
+                [transcript, source.summary, source.title, *[comment.text for comment in source.comments[:3]]],
+                1600,
+            )
+            unit = EvidenceUnit(
+                id=f"evidence-{source.id}",
+                text=text or source.title,
+                modality="speech" if transcript else "text",
+                source_id=source.id,
+                artifact_id=artifact.id,
+                normalized_text=(text or source.title).strip().lower(),
+                extraction_method="legacy-source-adapter",
+                content_hash=artifact.content_hash,
+            )
+            evidence_units.append(unit)
+
+        # Create coarse assessment at the source level
+        assessment = assess_evidence_quality(source, artifact=artifact, evidence_unit=evidence_units[-1] if evidence_units else None)
         assessments.append(assessment)
         source_scores[source.id] = assessment.label
 
@@ -458,6 +704,35 @@ def prepare_evidence_batch(batch: AcquisitionBatch) -> tuple[EvidenceBatch, Agen
         quality_assessments=tuple(assessments),
         source_scores=source_scores,
     ), step
+
+
+def _parse_timestamp_to_ms(value: str | int | float | None) -> int | None:
+    """Parse a timestamp value (str, int, or float) into milliseconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # If it looks like seconds (small number), convert to ms
+        return int(value * 1000) if value < 100000 else int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    # Try parsing as a number first
+    try:
+        num = float(text)
+        return int(num * 1000) if num < 100000 else int(num)
+    except ValueError:
+        pass
+    # Parse MM:SS or HH:MM:SS format
+    parts = text.split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(nums) == 2:
+        return (nums[0] * 60 + nums[1]) * 1000
+    if len(nums) == 3:
+        return (nums[0] * 3600 + nums[1] * 60 + nums[2]) * 1000
+    return None
 
 
 def build_claim_set_from_report(
@@ -560,10 +835,13 @@ async def _build_report_with_orchestrator(
 
 
 def _report_llm_provider(request: ResearchRequest, sources: list[Source]):
-    """Build the provider adapter used exclusively by the LLM orchestrator."""
+    """Build the provider adapter used exclusively by the LLM orchestrator.
 
-    def provider(_: LLMCallSpec, inputs: dict[str, Any]) -> LlmSynthesisResult | None:
-        return synthesize_with_llm(
+    Uses the async transport so independent LLM calls run concurrently.
+    """
+
+    async def provider(_: LLMCallSpec, inputs: dict[str, Any]) -> LlmSynthesisResult | None:
+        return await synthesize_with_llm_async(
             need=request.need,
             query=str(inputs["query"]),
             lang=request.lang,
@@ -608,10 +886,11 @@ def _supplemental_plan(
 def _sources_for_report(batch: AcquisitionBatch, evidence_batch: EvidenceBatch) -> list[Source]:
     """Create mutable report-only copies decorated from immutable evidence outputs."""
 
-    assessment_by_source = {
-        unit.source_id: assessment
-        for unit, assessment in zip(evidence_batch.evidence_units, evidence_batch.quality_assessments, strict=True)
-    }
+    assessment_by_source: dict[int, Any] = {}
+    ranked_source_ids = list(evidence_batch.source_scores.keys())
+    for idx, assessment in enumerate(evidence_batch.quality_assessments):
+        if idx < len(ranked_source_ids):
+            assessment_by_source[ranked_source_ids[idx]] = assessment
     sources = [source.model_copy(deep=True) for source in batch.sources]
     for source in sources:
         assessment = assessment_by_source.get(source.id)

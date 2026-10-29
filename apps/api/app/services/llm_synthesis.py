@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
-import urllib.request
 from typing import Any
 
+import httpx
+
 from app.models import CitationText, CoverageSummary, ReportInsight, ReportSection, Source
+from app.services.llm_transport import (
+    LLMTransportError,
+    gather_independent_calls,
+    post_with_retry,
+)
 from app.services.llm_types import (
     DecisionAttributeExtractionResult,
     DecisionContradictionResult,
@@ -98,7 +105,7 @@ def synthesize_with_llm(
                 ),
             },
         ],
-        "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.25")),
+        "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.45")),
         "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "5000")),
         "response_format": {"type": "json_object"},
     }
@@ -115,6 +122,206 @@ def synthesize_with_llm(
         result.warnings = [*decision_contradictions.warnings, *result.warnings][:6]
     result.model = model
     return result
+
+
+async def synthesize_with_llm_async(
+    *,
+    need: str,
+    query: str,
+    lang: str,
+    sources: list[Source],
+    coverage: CoverageSummary,
+    report_kind: str,
+    client: httpx.AsyncClient | None = None,
+) -> LlmSynthesisResult | None:
+    """Async synthesis with concurrent independent LLM calls.
+
+    Runs semantic-evidence extraction and decision-attribute extraction in
+    parallel when both are needed, then sequentially runs contradiction
+    analysis (depends on attributes), source selection (depends on semantic
+    evidence), and final report synthesis.
+    """
+
+    if not _enabled() or not sources:
+        return None
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.getenv("OPENROUTER_MODEL", "z-ai/glm-5.1")
+    needs_decision = report_kind in {"consumer", "decision"}
+
+    # Build payloads for independent calls that can run concurrently
+    independent_payloads: list[dict[str, Any]] = []
+    semantic_index = 0
+    decision_index = -1
+
+    semantic_payload = _build_semantic_payload(model, need, query, lang, sources, report_kind)
+    independent_payloads.append(semantic_payload)
+
+    if needs_decision:
+        decision_index = len(independent_payloads)
+        independent_payloads.append(_build_decision_attribute_payload(model, need, query, lang, sources))
+
+    # Fire independent calls concurrently
+    results = await gather_independent_calls(independent_payloads, client=client, max_concurrency=3)
+
+    # Parse semantic evidence
+    semantic_content = results[semantic_index]
+    semantic_result: SemanticEvidenceExtractionResult | None = None
+    if isinstance(semantic_content, str):
+        parsed_semantic = _parse_json(semantic_content, array_key="evidence")
+        valid_source_ids = {source.id for source in sources}
+        semantic_result = SemanticEvidenceExtractionResult(
+            evidence=sanitize_semantic_evidence(parsed_semantic.get("evidence", parsed_semantic.get("semanticEvidence", [])), valid_source_ids),
+            warnings=[str(item)[:240] for item in parsed_semantic.get("warnings", []) if str(item).strip()][:6],
+            model=model,
+        )
+    semantic_evidence = semantic_result.evidence if semantic_result else []
+
+    # Parse decision attributes if we ran that call
+    decision_attributes: DecisionAttributeExtractionResult | None = None
+    if needs_decision and decision_index >= 0:
+        decision_content = results[decision_index]
+        if isinstance(decision_content, str):
+            parsed_decision = _parse_json(decision_content)
+            valid_source_ids = {source.id for source in sources}
+            decision_attributes = DecisionAttributeExtractionResult(
+                products=sanitize_decision_products(parsed_decision.get("products", parsed_decision.get("productAttributes", {})), valid_source_ids),
+                warnings=[str(item)[:240] for item in parsed_decision.get("warnings", []) if str(item).strip()][:6],
+                model=model,
+            )
+
+    # Contradiction analysis depends on decision attributes
+    decision_contradictions: DecisionContradictionResult | None = None
+    if decision_attributes and decision_attributes.products:
+        contradiction_payload = _build_contradiction_payload(model, need, query, lang, decision_attributes.products)
+        contradiction_content = await post_with_retry(contradiction_payload, api_key=api_key, client=client)
+        if isinstance(contradiction_content, str):
+            parsed_contradiction = _parse_json(contradiction_content)
+            decision_contradictions = DecisionContradictionResult(
+                contradictions=sanitize_contradictions(parsed_contradiction.get("contradictions", parsed_contradiction.get("contradictionAnalysis", {}))),
+                warnings=[str(item)[:240] for item in parsed_contradiction.get("warnings", []) if str(item).strip()][:6],
+                model=model,
+            )
+
+    # Source selection depends on semantic evidence
+    selection_payload = _build_selection_payload(model, need, query, lang, sources, coverage, report_kind, semantic_evidence)
+    selection_content = await post_with_retry(selection_payload, api_key=api_key, client=client)
+    selected_ids: list[int] = []
+    synthesis_sources = sources
+    selection_warnings: list[str] = []
+    if isinstance(selection_content, str):
+        parsed_selection = _parse_json(selection_content, array_key="selectedSourceIds")
+        selected_ids = valid_ids(
+            parsed_selection.get("selectedSourceIds", parsed_selection.get("sourceIds", parsed_selection.get("sources", []))),
+            {source.id for source in sources},
+        )
+        sources_by_id = {source.id: source for source in sources}
+        synthesis_sources = [sources_by_id[sid] for sid in selected_ids if sid in sources_by_id] or sources
+        selection_warnings = [str(item)[:240] for item in parsed_selection.get("warnings", []) if str(item).strip()][:6]
+
+    selected_source_ids = [source.id for source in synthesis_sources]
+
+    # Final synthesis
+    synthesis_payload = _build_synthesis_payload(model, lang, report_kind, need, query, synthesis_sources, coverage, selected_source_ids, len(sources), semantic_evidence, decision_attributes, decision_contradictions)
+    content = await post_with_retry(synthesis_payload, api_key=api_key, client=client)
+    parsed = _parse_json(content, array_key="sections")
+    result = result_from_payload(parsed, set(selected_source_ids))
+    if selection_warnings:
+        result.warnings = [*selection_warnings, *result.warnings][:6]
+    if semantic_result and semantic_result.warnings:
+        result.warnings = [*semantic_result.warnings, *result.warnings][:6]
+    if decision_attributes and decision_attributes.warnings:
+        result.warnings = [*decision_attributes.warnings, *result.warnings][:6]
+    if decision_contradictions and decision_contradictions.warnings:
+        result.warnings = [*decision_contradictions.warnings, *result.warnings][:6]
+    result.model = model
+    return result
+
+
+def _build_semantic_payload(model: str, need: str, query: str, lang: str, sources: list[Source], report_kind: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _semantic_system_prompt(lang, report_kind)},
+            {"role": "user", "content": _semantic_extraction_prompt(need=need, query=query, lang=lang, sources=sources, report_kind=report_kind)},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_EXTRACTION_TEMPERATURE", "0.1")),
+        "max_tokens": int(os.getenv("OPENROUTER_EXTRACTION_MAX_TOKENS", "3500")),
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _build_decision_attribute_payload(model: str, need: str, query: str, lang: str, sources: list[Source]) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _decision_attribute_system_prompt(lang)},
+            {"role": "user", "content": _decision_attribute_prompt(need=need, query=query, lang=lang, sources=sources)},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_EXTRACTION_TEMPERATURE", "0.1")),
+        "max_tokens": int(os.getenv("OPENROUTER_DECISION_ATTRIBUTE_MAX_TOKENS", "3500")),
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _build_contradiction_payload(model: str, need: str, query: str, lang: str, attributes: dict[str, dict[str, list[dict[str, Any]]]]) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _decision_contradiction_system_prompt(lang)},
+            {"role": "user", "content": _decision_contradiction_prompt(need=need, query=query, lang=lang, attributes=attributes)},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_CONTRADICTION_TEMPERATURE", "0.1")),
+        "max_tokens": int(os.getenv("OPENROUTER_CONTRADICTION_MAX_TOKENS", "2200")),
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _build_selection_payload(model: str, need: str, query: str, lang: str, sources: list[Source], coverage: CoverageSummary, report_kind: str, semantic_evidence: list[SemanticEvidenceExtraction]) -> dict[str, Any]:
+    max_selected = int(os.getenv("VOXLENS_LLM_SELECTED_SOURCE_LIMIT", "24"))
+    max_selected = max(1, min(max_selected, len(sources)))
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _selection_system_prompt(lang)},
+            {"role": "user", "content": _selection_prompt(need=need, query=query, lang=lang, sources=sources, coverage=coverage, report_kind=report_kind, semantic_evidence=semantic_evidence, max_sources=max_selected)},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_SELECTION_TEMPERATURE", "0.1")),
+        "max_tokens": int(os.getenv("OPENROUTER_SELECTION_MAX_TOKENS", "1800")),
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _build_synthesis_payload(
+    model: str, lang: str, report_kind: str, need: str, query: str,
+    synthesis_sources: list[Source], coverage: CoverageSummary,
+    selected_source_ids: list[int], total_source_count: int,
+    semantic_evidence: list[SemanticEvidenceExtraction],
+    decision_attributes: DecisionAttributeExtractionResult | None,
+    decision_contradictions: DecisionContradictionResult | None,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _system_prompt(lang, report_kind)},
+            {
+                "role": "user",
+                "content": _user_prompt(
+                    need=need, query=query, lang=lang, sources=synthesis_sources,
+                    coverage=coverage, report_kind=report_kind,
+                    selected_source_ids=selected_source_ids, total_source_count=total_source_count,
+                    semantic_evidence=semantic_evidence,
+                    decision_attributes=decision_attributes.products if decision_attributes else {},
+                    contradiction_analysis=decision_contradictions.contradictions if decision_contradictions else {},
+                ),
+            },
+        ],
+        "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.45")),
+        "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "5000")),
+        "response_format": {"type": "json_object"},
+    }
 
 
 def extract_semantic_evidence_with_llm(
@@ -309,26 +516,13 @@ def _enabled() -> bool:
 
 
 def _post_chat_completion(api_key: str, payload: dict[str, Any]) -> str:
-    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {api_key}",
-        "http-referer": os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:8765"),
-        "x-title": os.getenv("OPENROUTER_X_TITLE", "VoxLens Alpha"),
-    }
-    timeout = int(os.getenv("OPENROUTER_TIMEOUT", "90"))
-    req = urllib.request.Request(f"{base_url}/chat/completions", data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 - OpenRouter endpoint is user-configurable
-        body = json.loads(response.read().decode("utf-8"))
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError("OpenRouter returned no choices")
-    message = choices[0].get("message") or {}
-    content = _message_content_text(message.get("content"))
-    if not content:
-        raise RuntimeError("OpenRouter returned empty content")
-    return content
+    """Synchronous wrapper around the async transport for backward compatibility.
+
+    Deprecated: prefer synthesize_with_llm_async for new callers. This keeps
+    existing synchronous call sites (e.g. report_builder.py fallback) working.
+    """
+
+    return asyncio.run(post_with_retry(payload, api_key=api_key))
 
 
 def _message_content_text(content: Any) -> str:
@@ -650,7 +844,7 @@ def _system_prompt(lang: str, report_kind: str = "general") -> str:
                 "你是 B 端产品/品类研究分析师。你的用户是产品、市场、运营或品牌团队，不是个人购物用户。\n"
                 "你的任务：\n"
                 "1. 只基于给定 sources、comments、transcripts 提炼品类范围、竞品格局、用户需求、卖点、机会和风险。\n"
-                "2. 使用固定 B 端报告模板：研究结论摘要、品类/产品范围、竞品与内容格局、用户声音与需求信号、机会/风险/分歧、证据缺口与下一步研究。\n"
+                "2. 覆盖这些信息目标：研究结论摘要、品类/产品范围、竞品与内容格局、用户声音与需求信号、机会/风险/分歧、证据缺口与下一步研究；段落结构和数量由你根据证据设计，不要机械套用固定模板。\n"
                 "3. 明确区分来源证据和你的业务推断；所有关键判断必须引用 source id。\n"
                 "规则：\n"
                 "1. 不输出“买 X / 不买 X”的 C 端购买建议。\n"
@@ -661,7 +855,7 @@ def _system_prompt(lang: str, report_kind: str = "general") -> str:
             "You are a B2B product/category research analyst. The user is a product, marketing, ops or brand team, not an individual shopper.\n"
             "Tasks:\n"
             "1. Use only the supplied sources, comments and transcripts to synthesize category scope, competitors, user demand, selling points, opportunities and risks.\n"
-            "2. Use the fixed B2B report template: Research Brief, Category & Product Scope, Competitive Landscape, User Voice & Demand Signals, Opportunities/Risks/Disagreements, Evidence Gaps & Next Research.\n"
+            "2. Cover these information goals: Research Brief, Category & Product Scope, Competitive Landscape, User Voice & Demand Signals, Opportunities/Risks/Disagreements, Evidence Gaps & Next Research — design your own section structure and count from the evidence instead of a fixed template.\n"
             "3. Separate source-backed evidence from business inference; cite source ids for every important claim.\n"
             "Rules:\n"
             "1. Do not produce C-end shopping advice such as 'buy X' or 'do not buy X'.\n"
@@ -701,7 +895,7 @@ def _user_prompt(
     evidence_by_source = _semantic_evidence_by_source(semantic_evidence)
     source_pack = [_source_payload(source, evidence_by_source.get(source.id, [])) for source in sources]
     schema = {
-        "takeaways": [{"text": "string", "citations": [1]}],
+        "takeaways": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}],
         "insights": [{"id": "short-id", "kind": "answer|consensus|disagreement|risk|opportunity|coverage", "label": "string", "summary": "string", "confidence": 1, "sourceIds": [1]}],
         "sections": [
             {
@@ -709,7 +903,7 @@ def _user_prompt(
                 "title": "1. 执行摘要" if zh else "1. Executive Summary",
                 "kind": "answer",
                 "body": "string",
-                "bullets": [{"text": "string", "citations": [1]}],
+                "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}],
                 "sourceIds": [1],
             }
         ],
@@ -722,10 +916,10 @@ def _user_prompt(
             else "Return English JSON, no markdown. Write for an ordinary shopper: do not use a fixed B2B template or market/category research. Choose 3-5 sections based on evidence, but include a clear recommendation, why, who it fits/doesn't fit, caveats or what to verify next. Use direct buyer-facing language and cite sources."
         )
         schema["sections"] = [
-            {"id": "quick-answer", "title": "先说结论" if zh else "Start with the answer", "kind": "consumer_answer", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
-            {"id": "why", "title": "为什么这么判断" if zh else "Why this answer", "kind": "consumer_reasoning", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
-            {"id": "fit-check", "title": "适合谁，不适合谁" if zh else "Who it fits, who should skip it", "kind": "consumer_fit", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
-            {"id": "caveats", "title": "避坑点和还要确认什么" if zh else "Caveats and what to check next", "kind": "consumer_caveats", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
+            {"id": "quick-answer", "title": "先说结论" if zh else "Start with the answer", "kind": "consumer_answer", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
+            {"id": "why", "title": "为什么这么判断" if zh else "Why this answer", "kind": "consumer_reasoning", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
+            {"id": "fit-check", "title": "适合谁，不适合谁" if zh else "Who it fits, who should skip it", "kind": "consumer_fit", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
+            {"id": "caveats", "title": "避坑点和还要确认什么" if zh else "Caveats and what to check next", "kind": "consumer_caveats", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
         ]
     elif report_kind == "decision":
         instructions = (
@@ -734,10 +928,10 @@ def _user_prompt(
             else "Return English JSON, no markdown. Purchase-decision reports must use four sections: My Needs, Candidate Filtering, Dimension Comparison Matrix, Final Recommendation. Dimensions come from source content, not fixed category templates; the final recommendation must clearly say 'buy X', include conditional advice and not-recommended cases."
         )
         schema["sections"] = [
-            {"id": "needs", "title": "1. 我的需求" if zh else "1. My Needs", "kind": "decision_needs", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
-            {"id": "candidates", "title": "2. 候选筛选" if zh else "2. Candidate Filtering", "kind": "candidate_map", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1], "data": {"candidates": [{"name": "string", "matchReason": "string", "sourceIds": [1]}]}},
+            {"id": "needs", "title": "1. 我的需求" if zh else "1. My Needs", "kind": "decision_needs", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
+            {"id": "candidates", "title": "2. 候选筛选" if zh else "2. Candidate Filtering", "kind": "candidate_map", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1], "data": {"candidates": [{"name": "string", "matchReason": "string", "sourceIds": [1]}]}},
             {"id": "dimension-comparison", "title": "3. 维度对比矩阵" if zh else "3. Dimension Comparison Matrix", "kind": "decision_matrix", "body": "string", "sourceIds": [1], "data": {"comparisons": [{"dimension": "source-derived name", "values": [{"candidate": "string", "conclusion": "string", "condition": "string", "confidence": "green|yellow|gray", "sourceIds": [1]}], "isContradictory": False, "contradictionReason": "string"}]}},
-            {"id": "final-recommendation", "title": "4. 最终推荐" if zh else "4. Final Recommendation", "kind": "final_recommendation", "body": "string", "bullets": [{"text": "string", "citations": [1]}], "sourceIds": [1]},
+            {"id": "final-recommendation", "title": "4. 最终推荐" if zh else "4. Final Recommendation", "kind": "final_recommendation", "body": "string", "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}], "sourceIds": [1]},
         ]
     elif report_kind == "business":
         instructions = (
@@ -774,6 +968,7 @@ def _user_prompt(
                 "When fullTranscript is present, use it as the richer synthesis context; transcriptPreview is only a UI preview.",
                 "Use semanticEvidence first when it is present; it was extracted from fuller transcript/content chunks before synthesis.",
                 "Put the source ids that support each section body in section.sourceIds, even when bullets also carry citations.",
+                "When citationRefs are available (from transcript segments or comments), include them to anchor claims to precise timestamps or comment locations. Format: {sourceId, startMs, endMs, citationRef, platform, platformObjectId}.",
             ],
             "outputSchema": schema,
             "semanticEvidence": [_semantic_evidence_payload(item) for item in semantic_evidence if item.sourceId in selected_source_ids],
@@ -793,7 +988,24 @@ def _business_section_schema(zh: bool) -> list[dict[str, Any]]:
             "title": item["title"],
             "kind": item["kind"],
             "body": "string",
-            "bullets": [{"text": "string", "citations": [1]}],
+            "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}],
+            "sourceIds": [1],
+            "metrics": {"confidence": "high|medium|low|insufficient"},
+            "data": {"validationGaps": ["unsupported market size/share/price/channel/persona claims"]},
+        }
+        for item in business_template_payload(zh)
+    ]
+
+
+
+def _business_section_schema(zh: bool) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item["id"],
+            "title": item["title"],
+            "kind": item["kind"],
+            "body": "string",
+            "bullets": [{"text": "string", "citations": [1], "citationRefs": [{"sourceId": 1, "startMs": 0, "endMs": 5000, "citationRef": "[PLATFORM:id@MM:SS-MM:SS]"}]}],
             "sourceIds": [1],
             "metrics": {"confidence": "high|medium|low|insufficient"},
             "data": {"validationGaps": ["unsupported market size/share/price/channel/persona claims"]},
@@ -845,6 +1057,8 @@ def _source_payload(source: Source, semantic_evidence: list[SemanticEvidenceExtr
         "transcriptPreview": text_excerpt([source.transcriptPreview], 900),
         "fullTranscript": full_transcript,
         "transcriptChunks": _transcript_chunks(source),
+        "transcriptSegments": _transcript_segment_payloads(source),
+        "transcriptSegments": _transcript_segment_payloads(source),
         "semanticEvidence": [_semantic_evidence_payload(item) for item in semantic_evidence or []],
     }
 
@@ -889,6 +1103,24 @@ def _full_transcript_text(source: Source, limit: int | None = None) -> str:
     )
     max_chars = limit if limit is not None else int(os.getenv("VOXLENS_LLM_MAX_TRANSCRIPT_CHARS_PER_SOURCE", "12000"))
     return text_excerpt([value], max_chars)
+
+
+def _transcript_segment_payloads(source: Source) -> list[dict[str, Any]]:
+    """Build timestamped transcript segment payloads for citation anchoring."""
+    segments = source.transcriptSegments
+    if not segments:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for idx, seg in enumerate(segments[:30]):
+        if not seg.text or not seg.text.strip():
+            continue
+        payloads.append({
+            "index": idx,
+            "text": seg.text.strip()[:600],
+            "start": seg.start,
+            "end": seg.end,
+        })
+    return payloads
 
 
 def _semantic_evidence_by_source(items: list[SemanticEvidenceExtraction]) -> dict[int, list[SemanticEvidenceExtraction]]:
